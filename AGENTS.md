@@ -15,91 +15,78 @@ This file provides guidance to AI coding agents working on the `skills` CLI code
 | `skills use <pkg>@<skill>`    | Use one skill without installing                    |
 | `skills experimental_install` | Restore skills from skills-lock.json                |
 | `skills experimental_sync`    | Sync skills from node_modules into agent dirs       |
-| `skills list`                 | List installed skills (alias: `ls`)                 |
+| `skills list`                 | List installed skills                               |
+| `skills find`                 | Find/search skills                                  |
+| `skills remove`               | Remove installed skills                             |
 | `skills update [skills...]`   | Update skills to latest versions                    |
 | `skills init [name]`          | Create a new SKILL.md template                      |
 
-Aliases: `skills a` works for `add`. `skills i`, `skills install` (no args) restore from `skills-lock.json`. `skills ls` works for `list`. `skills experimental_install` restores from `skills-lock.json`. `skills experimental_sync` reads skills from npm dependencies (`sync` remains a compatibility alias).
+Aliases: `skills a` works for `add`. `skills i`, `skills install` (no args) restore from `skills-lock.json`. `skills ls` works for `list`. `skills search`, `f`, `s` work for `find`. `skills rm`, `r` work for `remove`. `skills check` and `skills upgrade` run the same code as `update`. `sync` remains a compatibility alias for `experimental_sync`.
 
 ## Architecture
 
 ```
 src/
-├── cli.ts           # Main entry point, command routing, init/check/update
-├── cli.test.ts      # CLI tests
+├── cli.ts           # Main entry point, command routing, init
 ├── add.ts           # Core add command logic
-├── add-prompt.test.ts # Add prompt behavior tests
-├── add.test.ts      # Add command tests
-├── constants.ts      # Shared constants
-├── find.ts           # Find/search command
+├── install.ts       # Restore skills from skills-lock.json (experimental_install)
+├── update.ts        # check/update/upgrade - hash compare + reinstall (runUpdate)
+├── update-source.ts # Build the source input used when reinstalling a skill
 ├── list.ts          # List installed skills command
-├── list.test.ts     # List command tests
-├── remove.ts         # Remove command implementation
-├── remove.test.ts    # Remove command tests
+├── find.ts          # Find/search command
+├── remove.ts        # Remove command implementation
+├── sync.ts          # Sync command - crawl node_modules for skills
+├── use.ts           # Use command - generate a skill prompt or launch an agent
 ├── agents.ts        # Agent definitions and detection
+├── detect-agent.ts  # Detect when the CLI runs inside an AI agent
 ├── installer.ts     # Skill installation logic (symlink/copy) + listInstalledSkills
 ├── skills.ts        # Skill discovery and parsing
+├── frontmatter.ts   # Minimal YAML frontmatter parser
 ├── skill-lock.ts    # Global lock file management (~/.agents/.skill-lock.json)
 ├── local-lock.ts    # Local lock file management (skills-lock.json, checked in)
-├── sync.ts          # Sync command - crawl node_modules for skills
 ├── source-parser.ts # Parse git URLs, GitHub shorthand, local paths
 ├── git.ts           # Git clone operations
+├── blob.ts          # Skill snapshot downloads + GitHub tree fetch (fetchRepoTree)
+├── sanitize.ts      # Strip terminal escape sequences from untrusted strings
+├── plugin-manifest.ts # Plugin manifest discovery support
+├── constants.ts     # Shared constants
 ├── telemetry.ts     # Anonymous usage tracking
 ├── types.ts         # TypeScript types
-├── plugin-manifest.ts # Plugin manifest discovery support
+├── test-utils.ts    # Test utilities
 ├── prompts/         # Interactive prompt helpers
-│   └── search-multiselect.ts
-├── providers/       # Remote skill providers (GitHub, HuggingFace, Mintlify)
-│   ├── index.ts
-│   ├── registry.ts
-│   ├── types.ts
-│   └── wellknown.ts
-├── init.test.ts     # Init command tests
-├── use.ts           # Use command - generate a skill prompt or launch an agent
-├── use.test.ts      # Use command tests
-└── test-utils.ts    # Test utilities
-
-tests/
-├── cross-platform-paths.test.ts # Path normalization across platforms
-├── full-depth-discovery.test.ts # --full-depth skill discovery tests
-├── openclaw-paths.test.ts       # OpenClaw-specific path tests
-├── plugin-manifest-discovery.test.ts # Plugin manifest skill discovery
-├── sanitize-name.test.ts     # Tests for sanitizeName (path traversal prevention)
-├── skill-matching.test.ts    # Tests for filterSkills (multi-word skill name matching)
-├── source-parser.test.ts     # Tests for URL/path parsing
-├── installer-symlink.test.ts # Tests for symlink installation
-├── list-installed.test.ts    # Tests for listing installed skills
-├── skill-path.test.ts        # Tests for skill path handling
-├── wellknown-provider.test.ts # Tests for well-known provider
-├── xdg-config-paths.test.ts   # XDG global path handling tests
-└── dist.test.ts               # Tests for built distribution
+└── providers/       # Remote skill providers (registry, well-known)
 ```
+
+Other helpers and colocated `*.test.ts` files also live in `src/`. `tests/` holds the remaining
+suites, one `<topic>.test.ts` per behavior (paths, discovery, installer, agents, update, dist).
 
 ## Update Checking System
 
-### How `skills check` and `skills update` Work
+### How `skills update` Works
 
-1. Read `~/.agents/.skill-lock.json` for installed skills
-2. Filter to GitHub-backed skills that have both `skillFolderHash` and `skillPath`
-3. For each skill, call `fetchSkillFolderHash(source, skillPath, token)`. Tree requests start anonymously, then use an explicit `GITHUB_TOKEN`/`GH_TOKEN`, then `gh api` without exporting the GitHub CLI credential.
-4. `fetchSkillFolderHash` calls the GitHub Trees API (`/git/trees/<branch>?recursive=1` for `main`, then `master` fallback); update checks fall back to an authenticated Git clone when API access is unavailable.
+`skills check` and `skills upgrade` are aliases: all three run `runUpdate` in `src/update.ts`.
+
+1. Read installed skills for the resolved scope: the global lock `~/.agents/.skill-lock.json`, the project `skills-lock.json`, or both
+2. For the global lock, filter to GitHub-backed skills that have both `skillFolderHash` and `skillPath`
+3. For each source, call `fetchRepoTree(ownerRepo, ref, getToken)` in `src/blob.ts` and read the folder hash with `getSkillFolderHashFromTree` (`fetchSkillFolderHash(ownerRepo, skillPath, getToken?, ref?)` in `src/skill-lock.ts` wraps the same two calls). `getToken` is a lazy resolver: tree requests start anonymously, then use an explicit `GITHUB_TOKEN`/`GH_TOKEN`, then `gh api` without exporting the GitHub CLI credential.
+4. `fetchRepoTree` calls the GitHub Trees API (`/git/trees/<branch>?recursive=1`) for the locked ref, or for `HEAD`, then `main`, then `master` when there is none; update checks fall back to an authenticated Git clone when API access is unavailable.
 5. Compare latest folder tree SHA with lock file `skillFolderHash`; mismatch means update available
-6. `skills update` reinstalls changed skills by invoking the current CLI entrypoint directly (`node <repo>/bin/cli.mjs add <source-tree-url> -g -y`) to avoid nested npm exec/npx behavior
+6. Changed skills are reinstalled by invoking the current CLI entrypoint directly (`node <repo>/bin/cli.mjs add <source-tree-url> -g -y`) to avoid nested npm exec/npx behavior
 
 ### Lock File Compatibility
 
-The lock file format is v3. Key field: `skillFolderHash` (GitHub tree SHA for the skill folder).
+The global lock file format is v3. Key field: `skillFolderHash` (GitHub tree SHA for the skill folder). The project `skills-lock.json` is v1.
 
 If reading an older lock file version, it's wiped. Users must reinstall skills to populate the new format.
 
 ## Key Integration Points
 
-| Feature                    | Implementation                                                |
-| -------------------------- | ------------------------------------------------------------- |
-| `skills add`               | `src/add.ts` - full implementation                            |
-| `skills experimental_sync` | `src/sync.ts` - crawl node_modules                            |
-| `skills check`             | `src/cli.ts` + `fetchSkillFolderHash` in `src/skill-lock.ts`  |
-| `skills update`            | `src/cli.ts` direct hash compare + reinstall via `skills add` |
+| Feature                    | Implementation                                                   |
+| -------------------------- | ---------------------------------------------------------------- |
+| `skills add`               | `src/add.ts` - full implementation                               |
+| `skills experimental_sync` | `src/sync.ts` - crawl node_modules                               |
+| `skills check`             | Alias of `skills update`                                         |
+| `skills update`            | `src/update.ts` direct hash compare + reinstall via `skills add` |
 
 ## Factory collaboration
 
@@ -135,16 +122,6 @@ pnpm test tests/skill-matching.test.ts tests/source-parser.test.ts
 
 # Type check
 pnpm type-check
-
-# Format code
-pnpm format
-
-# Check formatting
-pnpm format:check
-
-# Validate and sync agent metadata/docs
-pnpm run -C scripts validate-agents.ts
-pnpm run -C scripts sync-agents.ts
 ```
 
 ## Code Style
@@ -152,24 +129,22 @@ pnpm run -C scripts sync-agents.ts
 This project uses Prettier for code formatting. **Always run `pnpm format` before committing changes** to ensure consistent formatting.
 
 ```bash
-# Format all files
+# Format src/ and scripts/
 pnpm format
 
 # Check formatting without fixing
 pnpm format:check
 ```
 
+The husky pre-commit hook (lint-staged) also formats staged files in `src/`, `scripts/`, and `tests/`.
+
 CI will fail if code is not properly formatted.
 
 ## Publishing
 
-```bash
-# 1. Bump version in package.json
-# 2. Build
-pnpm build
-# 3. Publish
-npm publish
-```
+Run the `Publish` GitHub Actions workflow (`.github/workflows/publish.yml`, manual dispatch) and
+choose a `patch` or `minor` bump. It builds, bumps the version, pushes the tag, publishes to npm,
+and creates the GitHub release.
 
 ## Adding a New Agent
 
